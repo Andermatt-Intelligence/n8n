@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import subprocess
 import time
 from typing import Callable, Awaitable
 from dataclasses import dataclass
@@ -55,7 +56,12 @@ from src.message_types import (
 )
 from src.message_serde import MessageSerde
 from src.task_state import TaskState, TaskStatus
-from src.task_executor import TaskExecutor
+from src.task_executor import (
+    TaskExecutor,
+    UvExecutor,
+    has_pep723_metadata,
+    is_uv_available,
+)
 from src.task_analyzer import TaskAnalyzer
 from src.config.security_config import SecurityConfig
 
@@ -102,6 +108,15 @@ class TaskRunner:
         self.last_activity_time = time.time()
         self.is_shutting_down = False
 
+        # UV execution support
+        self._uv_available = is_uv_available()
+        if self._uv_available and config.uv_enabled:
+            self.logger.info("UV execution enabled for PEP 723 scripts")
+        elif config.uv_enabled and not self._uv_available:
+            self.logger.warning(
+                "UV execution enabled but UV not found on PATH - falling back to exec()"
+            )
+
         self.task_broker_uri = config.task_broker_uri
         websocket_host = urlparse(config.task_broker_uri).netloc
         self.websocket_url = (
@@ -111,6 +126,12 @@ class TaskRunner:
     @property
     def running_tasks_count(self) -> int:
         return len(self.running_tasks)
+
+    def _should_use_uv(self, code: str) -> bool:
+        """Determine if UV should be used to execute the given code."""
+        return (
+            self.config.uv_enabled and self._uv_available and has_pep723_metadata(code)
+        )
 
     async def start(self) -> None:
         if self.config.is_auto_shutdown_enabled and not self.on_idle_timeout:
@@ -195,11 +216,20 @@ class TaskRunner:
 
         self.logger.warning(f"Terminating {self.running_tasks_count} tasks...")
 
-        tasks_to_terminate = [
-            asyncio.to_thread(self.executor.stop_process, task_state.process)
-            for task_state in self.running_tasks.values()
-            if task_state.process
-        ]
+        tasks_to_terminate = []
+        for task_state in self.running_tasks.values():
+            if task_state.process:
+                # Handle both subprocess.Popen (UV) and ForkServerProcess (exec) types
+                if isinstance(task_state.process, subprocess.Popen):
+                    tasks_to_terminate.append(
+                        asyncio.to_thread(UvExecutor.stop_process, task_state.process)
+                    )
+                else:
+                    tasks_to_terminate.append(
+                        asyncio.to_thread(
+                            self.executor.stop_process, task_state.process
+                        )
+                    )
 
         if tasks_to_terminate:
             await asyncio.gather(*tasks_to_terminate, return_exceptions=True)
@@ -301,6 +331,7 @@ class TaskRunner:
 
     async def _execute_task(self, task_id: str, task_settings: TaskSettings) -> None:
         start_time = time.time()
+        use_uv = self._should_use_uv(task_settings.code)
 
         try:
             task_state = self.running_tasks.get(task_id)
@@ -308,27 +339,20 @@ class TaskRunner:
             if task_state is None:
                 raise TaskMissingError(task_id)
 
-            self.analyzer.validate(task_settings.code)
-
-            process, read_conn, write_conn = self.executor.create_process(
-                code=task_settings.code,
-                node_mode=task_settings.node_mode,
-                items=task_settings.items,
-                security_config=self.security_config,
-                query=task_settings.query,
-            )
-
-            task_state.process = process
-
-            result, print_args, result_size_bytes = await asyncio.to_thread(
-                self.executor.execute_process,
-                process=process,
-                read_conn=read_conn,
-                write_conn=write_conn,
-                task_timeout=self.config.task_timeout,
-                pipe_reader_timeout=self.config.pipe_reader_timeout,
-                continue_on_fail=task_settings.continue_on_fail,
-            )
+            if use_uv:
+                # UV execution path for PEP 723 scripts
+                self.logger.debug(
+                    f"Task {task_id} using UV execution (PEP 723 detected)"
+                )
+                result, print_args, result_size_bytes = await self._execute_with_uv(
+                    task_id, task_state, task_settings
+                )
+            else:
+                # Standard exec() execution path
+                self.analyzer.validate(task_settings.code)
+                result, print_args, result_size_bytes = await self._execute_with_exec(
+                    task_id, task_state, task_settings
+                )
 
             for print_args_per_call in print_args:
                 await self._send_rpc_message(
@@ -370,6 +394,66 @@ class TaskRunner:
             self.running_tasks.pop(task_id, None)
             self._reset_idle_timer()
 
+    async def _execute_with_exec(
+        self, task_id: str, task_state: TaskState, task_settings: TaskSettings
+    ) -> tuple[list, list, int]:
+        """Execute task using the standard exec() path with multiprocessing."""
+        process, read_conn, write_conn = self.executor.create_process(
+            code=task_settings.code,
+            node_mode=task_settings.node_mode,
+            items=task_settings.items,
+            security_config=self.security_config,
+            query=task_settings.query,
+        )
+
+        task_state.process = process
+
+        result, print_args, result_size_bytes = await asyncio.to_thread(
+            self.executor.execute_process,
+            process=process,
+            read_conn=read_conn,
+            write_conn=write_conn,
+            task_timeout=self.config.task_timeout,
+            pipe_reader_timeout=self.config.pipe_reader_timeout,
+            continue_on_fail=task_settings.continue_on_fail,
+        )
+
+        return result, print_args, result_size_bytes
+
+    async def _execute_with_uv(
+        self, task_id: str, task_state: TaskState, task_settings: TaskSettings
+    ) -> tuple[list, list, int]:
+        """Execute task using UV for PEP 723 scripts with inline dependencies."""
+        process, script_path = UvExecutor.create_process(
+            code=task_settings.code,
+            node_mode=task_settings.node_mode,
+            items=task_settings.items,
+            query=task_settings.query,
+            default_deps=self.config.uv_default_deps,
+            task_timeout=self.config.task_timeout,
+        )
+
+        task_state.process = process
+        task_state.uv_script_path = script_path
+
+        try:
+            result, print_args, result_size_bytes = await asyncio.to_thread(
+                UvExecutor.execute_process,
+                process=process,
+                script_path=script_path,
+                task_timeout=self.config.task_timeout,
+            )
+
+            if task_settings.continue_on_fail:
+                return result, print_args, result_size_bytes
+
+            return result, print_args, result_size_bytes
+
+        except Exception as e:
+            if task_settings.continue_on_fail:
+                return [{"json": {"error": str(e)}}], [], 0
+            raise
+
     async def _handle_task_cancel(self, message: BrokerTaskCancel) -> None:
         task_id = message.task_id
         task_state = self.running_tasks.get(task_id)
@@ -386,7 +470,11 @@ class TaskRunner:
 
         if task_state.status == TaskStatus.RUNNING:
             task_state.status = TaskStatus.ABORTING
-            await asyncio.to_thread(self.executor.stop_process, task_state.process)
+            # Handle both subprocess.Popen (UV) and ForkServerProcess (exec) types
+            if isinstance(task_state.process, subprocess.Popen):
+                await asyncio.to_thread(UvExecutor.stop_process, task_state.process)
+            else:
+                await asyncio.to_thread(self.executor.stop_process, task_state.process)
             self.logger.info(
                 LOG_TASK_CANCEL.format(task_id=task_id, **task_state.context())
             )

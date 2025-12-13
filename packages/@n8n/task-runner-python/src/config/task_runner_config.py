@@ -21,6 +21,8 @@ from src.constants import (
     ENV_TASK_TIMEOUT,
     ENV_AUTO_SHUTDOWN_TIMEOUT,
     ENV_GRACEFUL_SHUTDOWN_TIMEOUT,
+    ENV_UV_ENABLED,
+    ENV_UV_DEFAULT_DEPS,
     PIPE_MSG_MAX_SIZE,
     TYPICAL_PAYLOAD_RATIO,
     PARSE_THROUGHPUT_BYTES_PER_SEC,
@@ -47,6 +49,14 @@ def parse_allowlist(allowlist_str: str, list_name: str) -> set[str]:
     return modules
 
 
+def parse_deps_list(deps_str: str) -> list[str]:
+    """Parse a comma-separated list of dependencies for UV."""
+    if not deps_str:
+        return []
+
+    return [dep.strip() for dep in deps_str.split(",") if dep.strip()]
+
+
 @dataclass
 class TaskRunnerConfig:
     grant_token: str
@@ -61,6 +71,8 @@ class TaskRunnerConfig:
     builtins_deny: set[str]
     env_deny: bool
     pipe_reader_timeout: float
+    uv_enabled: bool
+    uv_default_deps: list[str]
 
     @property
     def is_auto_shutdown_enabled(self) -> bool:
@@ -130,4 +142,6 @@ class TaskRunnerConfig:
             ),
             env_deny=read_bool_env(ENV_BLOCK_RUNNER_ENV_ACCESS, True),
             pipe_reader_timeout=pipe_reader_timeout,
+            uv_enabled=read_bool_env(ENV_UV_ENABLED, True),
+            uv_default_deps=parse_deps_list(read_str_env(ENV_UV_DEFAULT_DEPS, "")),
         )

@@ -4,8 +4,12 @@ import textwrap
 import json
 import io
 import os
+import re
+import subprocess
 import sys
 import logging
+import tempfile
+import shutil
 
 from src.errors import (
     TaskCancelledError,
@@ -47,7 +51,277 @@ logger = logging.getLogger(__name__)
 MULTIPROCESSING_CONTEXT = multiprocessing.get_context("forkserver")
 MAX_PRINT_ARGS_ALLOWED = 100
 
+# PEP 723 inline script metadata pattern (official reference implementation)
+# See: https://peps.python.org/pep-0723/#reference-implementation
+PEP723_REGEX = (
+    r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$"
+)
+PEP723_PATTERN = re.compile(PEP723_REGEX)
+
 type PipeConnection = Connection
+
+
+def has_pep723_metadata(code: str) -> bool:
+    """Check if code contains PEP 723 inline script metadata."""
+    return any(m.group("type") == "script" for m in PEP723_PATTERN.finditer(code))
+
+
+def is_uv_available() -> bool:
+    """Check if UV is available on the system."""
+    return shutil.which("uv") is not None
+
+
+def extract_pep723_block(code: str) -> str:
+    """
+    Extract the raw PEP 723 script block from code.
+
+    Returns the full block including delimiters, or empty string if not found.
+    """
+    matches = [
+        m for m in re.finditer(PEP723_PATTERN, code) if m.group("type") == "script"
+    ]
+    if matches:
+        return matches[0].group(0)
+    return ""
+
+
+def generate_uv_wrapper_script(
+    user_code: str,
+    node_mode: str,
+    items_json: str,
+    query_json: str,
+) -> str:
+    """
+    Generate a wrapper script for UV execution that preserves PEP 723 metadata.
+
+    The wrapper:
+    1. Preserves the user's PEP 723 metadata block (for dependencies)
+    2. Loads items from an environment variable (JSON)
+    3. Captures stdout/stderr from user code
+    4. Returns results as JSON on stdout
+    """
+    # Extract PEP 723 metadata from user code (preserve it at the top)
+    pep723_block = extract_pep723_block(user_code)
+
+    # Remove PEP 723 block from user code (we'll put it at the top of wrapper)
+    user_code_without_metadata = PEP723_PATTERN.sub("", user_code).strip()
+
+    # Indent user code for the function body
+    indented_user_code = textwrap.indent(user_code_without_metadata, "    ")
+
+    wrapper = f'''{pep723_block}
+# Auto-generated wrapper for n8n Python task execution
+import json
+import sys
+import io
+import os
+from contextlib import redirect_stdout, redirect_stderr
+
+# Load items from environment variable
+_items_json = os.environ.get("N8N_ITEMS", "[]")
+_query_json = os.environ.get("N8N_QUERY", "null")
+
+_items = json.loads(_items_json)
+_item = _items[0] if _items else {{}}
+_query = json.loads(_query_json)
+
+_user_stdout = io.StringIO()
+_user_stderr = io.StringIO()
+
+
+def _user_function():
+{indented_user_code}
+
+
+def _format_result(result, node_mode):
+    """Format the result based on node mode."""
+    if result is None:
+        return []
+
+    if node_mode == "per_item":
+        # Per-item mode expects results to be a list of items
+        if isinstance(result, list):
+            return result
+        return [result]
+
+    # all_items mode - wrap result appropriately
+    if isinstance(result, list):
+        return result
+
+    return [{{"json": result}}]
+
+
+try:
+    with redirect_stdout(_user_stdout), redirect_stderr(_user_stderr):
+        _result = _user_function()
+
+    _formatted_result = _format_result(_result, "{node_mode}")
+
+    print(json.dumps({{
+        "ok": True,
+        "result": _formatted_result,
+        "print_args": _user_stdout.getvalue().splitlines(),
+        "stderr": _user_stderr.getvalue(),
+    }}, default=str))
+
+except Exception as _e:
+    import traceback
+    print(json.dumps({{
+        "ok": False,
+        "error": {{
+            "message": str(_e),
+            "description": "",
+            "stack": traceback.format_exc(),
+            "stderr": _user_stderr.getvalue(),
+        }},
+        "print_args": _user_stdout.getvalue().splitlines(),
+    }}, default=str))
+    sys.exit(1)
+'''
+    return wrapper
+
+
+class UvExecutor:
+    """Handles execution of Python code via UV with PEP 723 support."""
+
+    @staticmethod
+    def create_process(
+        code: str,
+        node_mode: str,
+        items: list,
+        query,
+        default_deps: list[str],
+        task_timeout: int,
+    ) -> tuple[subprocess.Popen, str]:
+        """
+        Create a UV subprocess for executing a Python code task.
+
+        Returns the process and the path to the temp script (for cleanup).
+        """
+        items_json = json.dumps(items, default=str, ensure_ascii=False)
+        query_json = json.dumps(query, default=str, ensure_ascii=False)
+
+        wrapper_script = generate_uv_wrapper_script(
+            user_code=code,
+            node_mode=node_mode,
+            items_json=items_json,
+            query_json=query_json,
+        )
+
+        # Write wrapper script to a temp file
+        fd, script_path = tempfile.mkstemp(suffix=".py", prefix="n8n_uv_task_")
+        try:
+            os.write(fd, wrapper_script.encode("utf-8"))
+        finally:
+            os.close(fd)
+
+        # Build UV command
+        cmd = [
+            "uv",
+            "-qq",  # Silent mode
+            "--no-progress",
+            "run",
+            "--no-project",  # Don't use any pyproject.toml
+            "--no-config",  # Don't use any uv.toml
+        ]
+
+        # Add default dependencies via --with flag
+        for dep in default_deps:
+            cmd.extend(["--with", dep])
+
+        cmd.append(script_path)
+
+        # Set up environment with items data
+        env = os.environ.copy()
+        env["N8N_ITEMS"] = items_json
+        env["N8N_QUERY"] = query_json
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
+        )
+
+        return process, script_path
+
+    @staticmethod
+    def execute_process(
+        process: subprocess.Popen,
+        script_path: str,
+        task_timeout: int,
+    ) -> tuple[list, list[list[str]], int]:
+        """
+        Execute a UV subprocess and return the results.
+
+        Returns: (result_items, print_args, result_size_bytes)
+        """
+        try:
+            stdout, stderr = process.communicate(timeout=task_timeout)
+
+            if process.returncode == -15:  # SIGTERM
+                raise TaskCancelledError()
+
+            if process.returncode != 0:
+                # Try to parse error from stdout (our wrapper outputs JSON even on error)
+                try:
+                    response = json.loads(stdout)
+                    if not response.get("ok"):
+                        error = response.get("error", {})
+                        raise TaskRuntimeError(error)
+                except json.JSONDecodeError:
+                    # Fallback to stderr
+                    raise TaskRuntimeError(
+                        {
+                            "message": f"UV execution failed with exit code {process.returncode}",
+                            "description": stderr,
+                            "stack": "",
+                            "stderr": stderr,
+                        }
+                    )
+
+            # Parse successful response
+            response = json.loads(stdout)
+
+            if not response.get("ok"):
+                error = response.get("error", {})
+                raise TaskRuntimeError(error)
+
+            result = response.get("result", [])
+            print_args = [[line] for line in response.get("print_args", [])]
+            result_size_bytes = len(stdout.encode("utf-8"))
+
+            return result, print_args, result_size_bytes
+
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise TaskTimeoutError(task_timeout)
+
+        finally:
+            # Clean up temp script
+            try:
+                os.unlink(script_path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def stop_process(process: subprocess.Popen | None):
+        """Stop a running UV subprocess."""
+        if process is None:
+            return
+
+        try:
+            if process.poll() is None:  # Still running
+                process.terminate()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        except (ProcessLookupError, OSError):
+            pass
 
 
 class TaskExecutor:

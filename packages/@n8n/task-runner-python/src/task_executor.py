@@ -109,21 +109,29 @@ def generate_uv_wrapper_script(
     # Indent user code for the function body
     indented_user_code = textwrap.indent(user_code_without_metadata, "    ")
 
-    wrapper = f'''{pep723_block}
-# Auto-generated wrapper for n8n Python task execution
+    if node_mode == "all_items":
+        return _generate_all_items_wrapper(pep723_block, indented_user_code)
+    else:
+        return _generate_per_item_wrapper(pep723_block, indented_user_code)
+
+
+def _generate_all_items_wrapper(pep723_block: str, indented_user_code: str) -> str:
+    """Generate wrapper for all_items mode (run once with all items)."""
+    return f'''{pep723_block}
+# Auto-generated wrapper for n8n Python task execution (all_items mode)
 import json
 import sys
 import io
 import os
 from contextlib import redirect_stdout, redirect_stderr
 
-# Load items from environment variable (mode-specific availability)
+# Load items from environment variable
 _items_json = os.environ.get("N8N_ITEMS", "[]")
 _query_json = os.environ.get("N8N_QUERY", "null")
 
-{"# all_items mode: _items and _query available" if node_mode == "all_items" else "# per_item mode: only _item available"}
-{"_items = json.loads(_items_json)" if node_mode == "all_items" else "_item = (lambda items: items[0] if items else {})(json.loads(_items_json))"}
-{"_query = json.loads(_query_json)" if node_mode == "all_items" else ""}
+# all_items mode: _items and _query available
+_items = json.loads(_items_json)
+_query = json.loads(_query_json)
 
 _user_stdout = io.StringIO()
 _user_stderr = io.StringIO()
@@ -133,33 +141,21 @@ def _user_function():
 {indented_user_code}
 
 
-def _format_result(result, node_mode):
-    """Format the result based on node mode."""
-    if result is None:
-        return []
-
-    if node_mode == "per_item":
-        # Per-item mode expects results to be a list of items
-        if isinstance(result, list):
-            return result
-        return [result]
-
-    # all_items mode - wrap result appropriately
-    if isinstance(result, list):
-        return result
-
-    return [{{"json": result}}]
-
-
 try:
     with redirect_stdout(_user_stdout), redirect_stderr(_user_stderr):
         _result = _user_function()
 
-    _formatted_result = _format_result(_result, "{node_mode}")
+    # Format result for all_items mode
+    if _result is None:
+        _formatted = []
+    elif isinstance(_result, list):
+        _formatted = _result
+    else:
+        _formatted = [{{"json": _result}}]
 
     print(json.dumps({{
         "ok": True,
-        "result": _formatted_result,
+        "result": _formatted,
         "print_args": _user_stdout.getvalue().splitlines(),
         "stderr": _user_stderr.getvalue(),
     }}, default=str))
@@ -178,7 +174,87 @@ except Exception as _e:
     }}, default=str))
     sys.exit(1)
 '''
-    return wrapper
+
+
+def _generate_per_item_wrapper(pep723_block: str, indented_user_code: str) -> str:
+    """Generate wrapper for per_item mode (run once per item, loop over all items)."""
+    return f'''{pep723_block}
+# Auto-generated wrapper for n8n Python task execution (per_item mode)
+import json
+import sys
+import io
+import os
+from contextlib import redirect_stdout, redirect_stderr
+
+# Load items from environment variable
+_items_json = os.environ.get("N8N_ITEMS", "[]")
+_all_items = json.loads(_items_json)
+
+_user_stdout = io.StringIO()
+_user_stderr = io.StringIO()
+
+# per_item mode: _item will be set for each iteration
+_item = None
+
+
+def _user_function():
+{indented_user_code}
+
+
+def _extract_json_data(user_output):
+    """Extract JSON data from user output, handling various formats."""
+    if not isinstance(user_output, dict):
+        return user_output
+    if "json" in user_output:
+        return user_output["json"]
+    if "binary" in user_output:
+        return {{k: v for k, v in user_output.items() if k != "binary"}}
+    return user_output
+
+
+try:
+    _results = []
+
+    # Loop over all items (this is how native per_item mode works)
+    for _index, _item in enumerate(_all_items):
+        with redirect_stdout(_user_stdout), redirect_stderr(_user_stderr):
+            _output = _user_function()
+
+        # Skip if user returns None (filtering)
+        if _output is None:
+            continue
+
+        # Build output item with pairedItem metadata
+        _json_data = _extract_json_data(_output)
+        _output_item = {{"json": _json_data, "pairedItem": {{"item": _index}}}}
+
+        # Handle binary data if present
+        if isinstance(_output, dict) and "binary" in _output:
+            _output_item["binary"] = _output["binary"]
+
+        _results.append(_output_item)
+
+    print(json.dumps({{
+        "ok": True,
+        "result": _results,
+        "print_args": _user_stdout.getvalue().splitlines(),
+        "stderr": _user_stderr.getvalue(),
+    }}, default=str))
+
+except Exception as _e:
+    import traceback
+    print(json.dumps({{
+        "ok": False,
+        "error": {{
+            "message": str(_e),
+            "description": "",
+            "stack": traceback.format_exc(),
+            "stderr": _user_stderr.getvalue(),
+        }},
+        "print_args": _user_stdout.getvalue().splitlines(),
+    }}, default=str))
+    sys.exit(1)
+'''
 
 
 class UvExecutor:

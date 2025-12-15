@@ -117,13 +117,13 @@ import io
 import os
 from contextlib import redirect_stdout, redirect_stderr
 
-# Load items from environment variable
+# Load items from environment variable (mode-specific availability)
 _items_json = os.environ.get("N8N_ITEMS", "[]")
 _query_json = os.environ.get("N8N_QUERY", "null")
 
-_items = json.loads(_items_json)
-_item = _items[0] if _items else {{}}
-_query = json.loads(_query_json)
+{"# all_items mode: _items and _query available" if node_mode == "all_items" else "# per_item mode: only _item available"}
+{"_items = json.loads(_items_json)" if node_mode == "all_items" else "_item = (lambda items: items[0] if items else {})(json.loads(_items_json))"}
+{"_query = json.loads(_query_json)" if node_mode == "all_items" else ""}
 
 _user_stdout = io.StringIO()
 _user_stderr = io.StringIO()
